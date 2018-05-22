@@ -8,6 +8,8 @@ import scala.concurrent.duration._
 import akka.actor.{ActorSystem, Cancellable}
 import com.typesafe.scalalogging.Logger
 
+import scala.collection.concurrent.TrieMap
+
 trait ThrottlingService {
   val graceRps: Int // configurable
   val slaService: SlaService // use mocks/stubs for testing
@@ -16,20 +18,20 @@ trait ThrottlingService {
   def isRequestAllowed(token: Option[String]): Boolean
 }
 
-class ThrottlingServiceImpl(implicit system: ActorSystem) extends ThrottlingService {
+class ThrottlingServiceImpl(settings: Settings, _slaService: SlaService)(implicit system: ActorSystem) extends ThrottlingService {
   private val logger = Logger(classOf[ThrottlingServiceImpl])
-  private val conf = ConfigFactory.load()
-  private val slaIntervalsPerSecond = conf.getInt("throttling-service.slaIntervalsPerSecond")
-  private val slaTimeoutMilliseconds = conf.getInt("throttling-service.slaTimeoutMilliseconds")
-  private var userRequestsCount: scala.collection.mutable.Map[String, Int] = scala.collection.mutable.Map()
+
+  private val slaIntervalsPerSecond = settings.slaIntervalsPerSecond
+  private val slaTimeoutMilliseconds = settings.slaTimeoutMilliseconds
+  private var userRequestsCount: TrieMap[String, Int] = TrieMap()
 
   val userRequestsCountReset: Cancellable = system.scheduler.schedule(0.milliseconds, (1000 / slaIntervalsPerSecond).milliseconds) {
-    userRequestsCount.map(elm => (elm._1, 0))
-    logger.info("User requests counter has been reset")
+    userRequestsCount.clear()
+    logger.info("User requests counter has been reset, count = " + userRequestsCount.values.sum)
   }
 
-  override val graceRps: Int = conf.getInt("throttling-service.graceRps")
-  override val slaService: SlaService = new SlaServiceCache
+  override val graceRps: Int = settings.graceRps
+  override val slaService: SlaService = new SlaServiceCache(_slaService)
 
   override def isRequestAllowed(token: Option[String]): Boolean = {
     logger.info("Request received, token: " + token)
@@ -37,14 +39,18 @@ class ThrottlingServiceImpl(implicit system: ActorSystem) extends ThrottlingServ
     def isLimitReached(sla: Sla): Boolean = {
       userRequestsCount.get(sla.user) match {
         case Some(x) if x >= (sla.rps / slaIntervalsPerSecond) =>
+          logger.info("Request denied for user = " + sla.user)
           false
         case Some(x) if x < (sla.rps / slaIntervalsPerSecond) =>
           userRequestsCount.update(sla.user, x + 1)
+          logger.info("Request allowed for user = " + sla.user)
           true
         case None if sla.rps <= 0 =>
+          logger.info("Request denied for user = " + sla.user)
           false
         case None if sla.rps > 0 =>
           userRequestsCount.+=((sla.user, 1))
+          logger.info("Request allowed for user = " + sla.user)
           true
       }
     }
@@ -69,7 +75,14 @@ class ThrottlingServiceImpl(implicit system: ActorSystem) extends ThrottlingServ
 object ThrottlingServiceImpl {
   def main(args: Array[String]): Unit = {
     implicit val system: ActorSystem = ActorSystem("ThrottlingService")
-    val throttlingService = new ThrottlingServiceImpl
+    val slaServiceMock: SlaService = new SlaServiceMock(Map(
+      "aaa" -> Sla("Andy", 300),
+      "sss" -> Sla("Sam", 200),
+      "ddd" -> Sla("Andy", 300),
+      "kkk" -> Sla("Kevin", 400),
+      "nnn" -> Sla("Kevin", 400)
+    ))
+    val throttlingService = new ThrottlingServiceImpl(new SettingsFromConfig(ConfigFactory.load()), slaServiceMock)
     println(throttlingService.isRequestAllowed(Option("aaa")))
     println(throttlingService.isRequestAllowed(Option("aaa")))
     println(throttlingService.isRequestAllowed(Option("sss")))
@@ -77,7 +90,7 @@ object ThrottlingServiceImpl {
     println(throttlingService.isRequestAllowed(Option("aaa")))
     println(throttlingService.isRequestAllowed(Option("aaa")))
     println(throttlingService.isRequestAllowed(Option("sss")))
-    println(throttlingService.isRequestAllowed(Option("aaa")))
+    println(throttlingService.isRequestAllowed(Option("ddd")))
     println(throttlingService.isRequestAllowed(Option("aaa")))
     println(throttlingService.isRequestAllowed(Option("nnn")))
     println(throttlingService.isRequestAllowed(Option("aaa")))
